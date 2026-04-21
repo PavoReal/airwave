@@ -40,12 +40,15 @@
             .url = "https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz",
             .hash = "N-V-__8AAGSMGgDb5aXYKy35qSci9DNnFT7K51Y6qzdhG82Z",
         },
-        // TODO(zgui-upstream): swap to zig-gamedev/zgui once PR #103 lands.
+        // TODO(zgui-upstream): swap to zig-gamedev/zgui once PR #103 lands and zsdl
+        // is made Zig-0.16-compatible.
         // Tracking: https://github.com/zig-gamedev/zgui/pull/103
-        // To swap: `zig fetch --save=zgui git+https://github.com/zig-gamedev/zgui#<ref>`
+        // Fork: PavoReal/zgui@airwave-no-zsdl — removes the unused zsdl dep that
+        // blocks Zig 0.16 eager-build-graph compilation.
+        // To swap back: `zig fetch --save=zgui git+https://github.com/zig-gamedev/zgui#<ref>`
         .zgui = .{
-            .url = "git+https://github.com/cyberegoorg/zgui.git?ref=upgrade_to_zig_16#dc4344aa02b78465bb0d769b5889a99feae4ca6b",
-            .hash = "zgui-0.6.0-dev--L6sZMuAcQDjqZqVM-2t89cR17mtI2Y9Z5zI_CxSiUzj",
+            .url = "git+https://github.com/PavoReal/zgui.git?ref=airwave-no-zsdl#e6172fb2d50f2b002ca556141f1de1f50b5066a6",
+            .hash = "zgui-0.6.0-dev--L6sZOx8cQAt2pkwvC7bcmSI5dBHzIVSU5a9YlVIZyEA",
         },
         .sdl = .{
             .url = "git+https://github.com/allyourcodebase/SDL3.git?ref=main#5cc90328e8828459d8afe081e0f816a34fc119a8",
