@@ -1,8 +1,75 @@
+//! Zig bindings for libhackrf.
+//!
+//! ## Usage
+//!
+//! Initialize the library once at program start, then open a device, configure
+//! it, and stream samples through a callback. Always close the device and call
+//! `deinit` before exit.
+//!
+//! ```zig
+//! const hackrf = @import("hackrf.zig");
+//!
+//! try hackrf.init();
+//! defer hackrf.deinit() catch {};
+//!
+//! const dev = try hackrf.Device.open();
+//! defer dev.close();
+//!
+//! try dev.setSampleRate(10_000_000);
+//! try dev.setFreq(915_000_000);
+//! try dev.setLnaGain(24);
+//! try dev.setVgaGain(20);
+//! try dev.setAmpEnable(false);
+//! ```
+//!
+//! ## Example: receive IQ samples
+//!
+//! The callback runs on libhackrf's streaming thread. Return `.@"continue"`
+//! to keep streaming or `.stop` to halt. Use `Transfer.iqSamples()` for a
+//! zero-copy view of the buffer as `IQSample` pairs.
+//!
+//! ```zig
+//! const Ctx = struct { count: usize = 0 };
+//! var ctx: Ctx = .{};
+//!
+//! const Cb = struct {
+//!     fn onRx(transfer: hackrf.Transfer, c: *Ctx) hackrf.StreamAction {
+//!         const samples = transfer.iqSamples();
+//!         c.count += samples.len;
+//!         return if (c.count > 1_000_000) .stop else .@"continue";
+//!     }
+//! };
+//!
+//! try dev.startRx(*Ctx, Cb.onRx, &ctx);
+//! while (dev.isStreaming()) std.Thread.sleep(10 * std.time.ns_per_ms);
+//! try dev.stopRx();
+//! ```
+//!
+//! ## Example: transmit IQ samples
+//!
+//! TX callbacks fill the provided buffer each call. Use `iqSamplesBuffer()` to
+//! write into the full transfer buffer.
+//!
+//! ```zig
+//! const Tx = struct {
+//!     fn onTx(transfer: hackrf.Transfer, _: void) hackrf.StreamAction {
+//!         for (transfer.iqSamplesBuffer()) |*s| s.* = .{ .i = 0, .q = 0 };
+//!         return .@"continue";
+//!     }
+//! };
+//!
+//! try dev.setTxVgaGain(20);
+//! try dev.startTx(void, Tx.onTx, {});
+//! ```
+//!
+//! ## Error handling
+//!
+//! All fallible calls return `Error!T`. Use `errorName` to get a human-readable
+//! string for a returned error.
+
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("hackrf.h");
-});
+pub const c = @import("c");
 
 // Re-export raw C bindings for advanced use cases
 pub const raw = c;

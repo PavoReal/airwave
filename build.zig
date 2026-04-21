@@ -157,12 +157,16 @@ pub fn build(b: *std.Build) void {
     });
 
     //
-    // airwave module (library root)
+    // Translate libhackrf C headers into a Zig module
     //
-    const mod = b.addModule("airwave", .{
-        .root_source_file = b.path("src/airwave.zig"),
+    const hackrf_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/hackrf_c.h"),
         .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
+    hackrf_translate.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
+    const hackrf_c_mod = hackrf_translate.createModule();
 
     //
     // hackrf module (libhackrf Zig wrapper)
@@ -170,9 +174,22 @@ pub fn build(b: *std.Build) void {
     const hackrf_mod = b.addModule("hackrf", .{
         .root_source_file = b.path("src/hackrf.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "c", .module = hackrf_c_mod },
+        },
     });
     hackrf_mod.linkLibrary(libhackrf);
-    hackrf_mod.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
+
+    //
+    // airwave module (library root)
+    //
+    const mod = b.addModule("airwave", .{
+        .root_source_file = b.path("src/airwave.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "hackrf", .module = hackrf_mod },
+        },
+    });
 
     //
     // airwave-server executable
@@ -190,9 +207,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    exe.root_module.linkLibrary(libhackrf);
-    exe.root_module.addIncludePath(hackrf_dep.path("host/libhackrf/src"));
-
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -203,6 +217,77 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    //
+    // zgui (Dear ImGui + ImPlot) — compiled with no backend so we can pair it
+    // with SDL3 headers we control. When zig-gamedev/zgui PR #103 merges, swap
+    // the .zgui URL in build.zig.zon back to canonical upstream.
+    //
+    const zgui_dep = b.dependency("zgui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .no_backend,
+        .with_implot = true,
+        .shared = false,
+    });
+
+    //
+    // SDL3 from source via allyourcodebase/SDL3
+    //
+    const sdl_dep = b.dependency("sdl", .{
+        .target = target,
+        .optimize = optimize,
+        .linkage = .static,
+    });
+    const sdl_lib = sdl_dep.artifact("SDL3");
+
+    //
+    // airwave-gui executable (SDL3 + SDL_GPU + Dear ImGui)
+    //
+    const gui_mod = b.createModule(.{
+        .root_source_file = b.path("src/gui_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "airwave", .module = mod },
+            .{ .name = "hackrf", .module = hackrf_mod },
+            .{ .name = "zgui", .module = zgui_dep.module("root") },
+        },
+    });
+    gui_mod.link_libcpp = true;
+
+    // Compile the ImGui SDL3 + SDL_GPU backend glue against *our* SDL3 headers
+    // so backend compile-time and link-time agree on the SDL3 version/ABI.
+    gui_mod.addIncludePath(zgui_dep.path("libs/imgui"));
+    gui_mod.addCSourceFiles(.{
+        .root = zgui_dep.path("libs/imgui/backends"),
+        .files = &.{
+            "imgui_impl_sdl3.cpp",
+            "imgui_impl_sdlgpu3.cpp",
+        },
+        .flags = &.{
+            "-fno-sanitize=undefined",
+            "-Wno-elaborated-enum-base",
+            "-DIMGUI_IMPL_API=extern \"C\"",
+            "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS",
+        },
+    });
+
+    gui_mod.linkLibrary(zgui_dep.artifact("imgui"));
+    gui_mod.linkLibrary(sdl_lib);
+
+    const gui_exe = b.addExecutable(.{
+        .name = "airwave-gui",
+        .root_module = gui_mod,
+    });
+    b.installArtifact(gui_exe);
+
+    const run_gui = b.addRunArtifact(gui_exe);
+    run_gui.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_gui.addArgs(args);
+    const run_gui_step = b.step("run-gui", "Run airwave-gui");
+    run_gui_step.dependOn(&run_gui.step);
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

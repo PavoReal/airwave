@@ -40,6 +40,17 @@
             .url = "https://github.com/libusb/libusb/archive/refs/tags/v1.0.27.tar.gz",
             .hash = "N-V-__8AAGSMGgDb5aXYKy35qSci9DNnFT7K51Y6qzdhG82Z",
         },
+        // TODO(zgui-upstream): swap to zig-gamedev/zgui once PR #103 lands.
+        // Tracking: https://github.com/zig-gamedev/zgui/pull/103
+        // To swap: `zig fetch --save=zgui git+https://github.com/zig-gamedev/zgui#<ref>`
+        .zgui = .{
+            .url = "git+https://github.com/cyberegoorg/zgui.git?ref=upgrade_to_zig_16#dc4344aa02b78465bb0d769b5889a99feae4ca6b",
+            .hash = "zgui-0.6.0-dev--L6sZMuAcQDjqZqVM-2t89cR17mtI2Y9Z5zI_CxSiUzj",
+        },
+        .sdl = .{
+            .url = "git+https://github.com/allyourcodebase/SDL3.git?ref=main#5cc90328e8828459d8afe081e0f816a34fc119a8",
+            .hash = "sdl-1.0.1+3.4.4-i4QD0QyGqQDgZygQmcCsv4heYJ2hxall1DeBJ8yyJndm",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that
