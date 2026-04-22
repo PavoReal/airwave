@@ -1,5 +1,8 @@
 const std = @import("std");
 const zgui = @import("zgui");
+const hackrf = @import("hackrf");
+const airwave = @import("airwave");
+const util = @import("util.zig");
 
 const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -37,10 +40,25 @@ fn sdlFail(comptime msg: []const u8) noreturn {
     std.debug.panic(msg ++ ": {s}", .{err});
 }
 
+const HackRFConnectionState = enum {
+    disconnected,
+    should_connect,
+    connected,
+    should_disconnect,
+};
+
+var hackrf_connection_state = HackRFConnectionState.disconnected;
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    const transient_buffer = allocator.alloc(u8, 1024 * 1024) catch @panic("allocator.alloc failed");
+    defer allocator.free(transient_buffer);
+
+    var transient_allocator = std.heap.FixedBufferAllocator.init(transient_buffer);
+    const trans_alloc = transient_allocator.allocator();
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
@@ -89,17 +107,47 @@ pub fn main() !void {
 
     var running = true;
 
+    hackrf.init() catch @panic("hackrf.init failed");
+    defer hackrf.deinit() catch @panic("hackrf.deinit failed");
+
+    const devices = try hackrf.DeviceList.get();
+    defer devices.deinit();
+
+    var hackrf_device_idx: usize = 0;
+
     while (running) {
+        //
+        // Event handling
+        //
+
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             _ = ImGui_ImplSDL3_ProcessEvent(&event);
+
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
                 c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                     if (event.window.windowID == c.SDL_GetWindowID(window)) running = false;
+                    hackrf_connection_state = .should_disconnect;
                 },
                 else => {},
             }
+        }
+
+        //
+        // Update state
+        //
+
+        switch (hackrf_connection_state) {
+            .should_connect => {
+                try airwave.start(allocator, io, hackrf_device_idx);
+                hackrf_connection_state = .connected;
+            },
+            .should_disconnect => {
+                try airwave.stop(allocator);
+                hackrf_connection_state = .disconnected;
+            },
+            else => {},
         }
 
         ImGui_ImplSDLGPU3_NewFrame();
@@ -107,19 +155,44 @@ pub fn main() !void {
         zgui.newFrame();
 
         //
-        //
+        // GUI
         //
 
-        if (zgui.begin("airwave", .{})) {
-            zgui.text("hello from airwave-gui", .{});
-            zgui.text("SDL3 + SDL_GPU + Dear ImGui", .{});
+        if (zgui.begin("Devices", .{})) {
+            zgui.text("HackRF One", .{});
+            for (devices.serialNumbers(), 0..) |serial_number, i| {
+                const label_buf: []u8 = try trans_alloc.alloc(u8, 1024);
+                var label: [:0]const u8 = undefined;
+
+                if (serial_number) |sn| {
+                    label = try std.fmt.bufPrintZ(label_buf, "{d}: {s}", .{ i + 1, sn });
+                } else {
+                    label = try std.fmt.bufPrintZ(label_buf, "{d}: unknown", .{i + 1});
+                }
+
+                if (zgui.button(label, .{})) {
+                    if (hackrf_connection_state == .disconnected) {
+                        hackrf_device_idx = i;
+                        hackrf_connection_state = .should_connect;
+                    } else {
+                        hackrf_connection_state = .should_disconnect;
+                    }
+                }
+            }
+        }
+        zgui.end();
+
+        if (hackrf_connection_state == .connected) {
+            if (zgui.begin("HackRF One", .{})) {
+                zgui.text("Sample Rate: {d} msps", .{airwave.sdr.getSampleRate() / util.MHz(1)});
+                zgui.text("CF: {d} MHz", .{airwave.sdr.getFreq() / util.MHz(1)});
+            }
+            zgui.end();
         }
 
         //
         //
         //
-
-        zgui.end();
 
         zgui.render();
         const draw_data = zgui.getDrawData();

@@ -6,20 +6,31 @@
 //! it, and stream samples through a callback. Always close the device and call
 //! `deinit` before exit.
 //!
+//! Each open `Device` carries a `Config` shadow of its RF settings. libhackrf
+//! has no real getter API for these knobs, so getters read the shadow. Setters
+//! update both the hardware and the shadow; on set failure the shadow is left
+//! untouched so it always reflects what the device was last told. Defaults are
+//! tuned for ADS-B reception at 1090 MHz.
+//!
+//! `Config` access is single-threaded — do not mutate or read it from the
+//! libhackrf RX/TX callback thread.
+//!
 //! ```zig
 //! const hackrf = @import("hackrf.zig");
 //!
 //! try hackrf.init();
 //! defer hackrf.deinit() catch {};
 //!
-//! const dev = try hackrf.Device.open();
+//! var dev = try hackrf.Device.open();
 //! defer dev.close();
 //!
-//! try dev.setSampleRate(10_000_000);
-//! try dev.setFreq(915_000_000);
-//! try dev.setLnaGain(24);
-//! try dev.setVgaGain(20);
-//! try dev.setAmpEnable(false);
+//! // Tweak any fields that differ from the defaults, then push the full state.
+//! dev.config.freq_hz = 915_000_000;
+//! dev.config.lna_gain = 24;
+//! try dev.applyConfig();
+//!
+//! // One-off tweaks after applyConfig are still fine; they update the shadow.
+//! try dev.setVgaGain(30);
 //! ```
 //!
 //! ## Example: receive IQ samples
@@ -210,8 +221,11 @@ pub const IQSample = extern struct {
 pub const Transfer = struct {
     inner: *c.hackrf_transfer,
 
-    pub fn device(self: Transfer) Device {
-        return .{ .handle = self.inner.device };
+    /// Raw libhackrf device handle this transfer belongs to.
+    /// Does not return a `Device` because synthesizing one here would give
+    /// callers a `Config` shadow disconnected from the real owning `Device`.
+    pub fn deviceHandle(self: Transfer) *c.hackrf_device {
+        return self.inner.device;
     }
 
     pub fn buffer(self: Transfer) []u8 {
@@ -336,6 +350,47 @@ pub const PartIdSerialNo = extern struct {
     serial_no: [4]u32,
 };
 
+/// Shadow of the RF / device configuration tracked on the Zig side.
+///
+/// libhackrf exposes only `hackrf_set_*` for these knobs — there is no
+/// read-back from the hardware — so `Device` stores a copy here and serves
+/// it through `get*` methods. Defaults are tuned for ADS-B @ 1090 MHz, which
+/// is this project's primary use case. Tweak the fields directly before
+/// calling `Device.applyConfig()`, or use the per-knob setters to update
+/// both the hardware and the shadow in one step.
+pub const Config = struct {
+    /// Sample rate in Hz. 2 Msps is the minimum HackRF rate and is wide
+    /// enough for ADS-B's 2 MHz envelope.
+    sample_rate_hz: f64 = 2_000_000,
+    /// Center frequency in Hz. 1090 MHz is the ADS-B downlink carrier.
+    freq_hz: u64 = 1_090_000_000,
+    /// Baseband filter bandwidth in Hz. 1.75 MHz is the nearest valid value
+    /// at or below a 2 Msps sample rate
+    /// (`hackrf_compute_baseband_filter_bw_round_down_lt(2_000_000)`).
+    bb_filter_bw_hz: u32 = 1_750_000,
+    /// LNA gain in dB. Valid range 0-40 in 8 dB steps. Max by default.
+    lna_gain: u32 = 40,
+    /// VGA gain in dB. Valid range 0-62 in 2 dB steps. Mid-range by default;
+    /// bump higher in weak-signal environments.
+    vga_gain: u32 = 20,
+    /// TX VGA gain in dB. Valid range 0-47 in 1 dB steps. Kept at 0 because
+    /// this project is RX-only.
+    tx_vga_gain: u32 = 0,
+    /// Front-end RF amplifier enable (~+14 dB).
+    amp_enable: bool = true,
+    /// Antenna port power (bias tee). Off by default; enable for powered
+    /// antennas.
+    antenna_enable: bool = false,
+    hw_sync_mode: bool = false,
+    clkout_enable: bool = false,
+    /// Front-panel UI enable. Leave on so the R9's LCD stays lit.
+    ui_enable: bool = true,
+    /// TX underrun limit; null means leave the firmware default in place.
+    tx_underrun_limit: ?u32 = null,
+    /// RX overrun limit; null means leave the firmware default in place.
+    rx_overrun_limit: ?u32 = null,
+};
+
 /// List of connected HackRF devices
 pub const DeviceList = struct {
     inner: *c.hackrf_device_list_t,
@@ -372,7 +427,7 @@ pub const DeviceList = struct {
     pub fn open(self: DeviceList, idx: usize) Error!Device {
         var handle: ?*c.hackrf_device = null;
         try checkResult(c.hackrf_device_list_open(self.inner, @intCast(idx), &handle));
-        return .{ .handle = handle orelse return error.NotFound };
+        return .{ .handle = handle orelse return error.NotFound, .config = .{} };
     }
 
     /// Check if a device is sharing its USB bus with other devices
@@ -389,19 +444,23 @@ pub const DeviceList = struct {
 /// HackRF device handle
 pub const Device = struct {
     handle: *c.hackrf_device,
+    /// Zig-side shadow of the device's current RF/config state. Initialized
+    /// to ADS-B-tuned defaults on open; not pushed to hardware until
+    /// `applyConfig()` is called or individual setters are used.
+    config: Config = .{},
 
     /// Open first available HackRF device
     pub fn open() Error!Device {
         var handle: ?*c.hackrf_device = null;
         try checkResult(c.hackrf_open(&handle));
-        return .{ .handle = handle orelse return error.NotFound };
+        return .{ .handle = handle orelse return error.NotFound, .config = .{} };
     }
 
     /// Open HackRF device by serial number
     pub fn openBySerial(serial: ?[*:0]const u8) Error!Device {
         var handle: ?*c.hackrf_device = null;
         try checkResult(c.hackrf_open_by_serial(serial, &handle));
-        return .{ .handle = handle orelse return error.NotFound };
+        return .{ .handle = handle orelse return error.NotFound, .config = .{} };
     }
 
     /// Close the device
@@ -487,80 +546,190 @@ pub const Device = struct {
     }
 
     // === Configuration ===
+    //
+    // Setters push to the hardware first and update the Config shadow only on
+    // success, so the shadow always reflects what the device was last told.
 
     /// Set center frequency in Hz
-    pub fn setFreq(self: Device, freq_hz: u64) Error!void {
+    pub fn setFreq(self: *Device, freq_hz: u64) Error!void {
         try checkResult(c.hackrf_set_freq(self.handle, freq_hz));
+        self.config.freq_hz = freq_hz;
     }
 
-    /// Set center frequency explicitly with IF, LO and filter path
-    pub fn setFreqExplicit(self: Device, if_freq_hz: u64, lo_freq_hz: u64, path: RfPathFilter) Error!void {
+    /// Set center frequency explicitly with IF, LO and filter path.
+    ///
+    /// Mutates hardware but does not update the tracked `Config` (the shadow
+    /// has no representation for explicit IF/LO). A subsequent `applyConfig`
+    /// will overwrite these settings with `config.freq_hz`.
+    pub fn setFreqExplicit(self: *Device, if_freq_hz: u64, lo_freq_hz: u64, path: RfPathFilter) Error!void {
         try checkResult(c.hackrf_set_freq_explicit(self.handle, if_freq_hz, lo_freq_hz, @intFromEnum(path)));
     }
 
     /// Set sample rate in Hz (2-20 MHz recommended)
-    pub fn setSampleRate(self: Device, freq_hz: f64) Error!void {
+    pub fn setSampleRate(self: *Device, freq_hz: f64) Error!void {
         try checkResult(c.hackrf_set_sample_rate(self.handle, freq_hz));
+        self.config.sample_rate_hz = freq_hz;
     }
 
-    /// Set sample rate with explicit frequency and divider
-    pub fn setSampleRateManual(self: Device, freq_hz: u32, divider: u32) Error!void {
+    /// Set sample rate with explicit frequency and divider.
+    ///
+    /// Mutates hardware but does not update the tracked `Config`. A
+    /// subsequent `applyConfig` will overwrite with `config.sample_rate_hz`.
+    pub fn setSampleRateManual(self: *Device, freq_hz: u32, divider: u32) Error!void {
         try checkResult(c.hackrf_set_sample_rate_manual(self.handle, freq_hz, divider));
     }
 
     /// Set baseband filter bandwidth in Hz
-    pub fn setBasebandFilterBandwidth(self: Device, bandwidth_hz: u32) Error!void {
+    pub fn setBasebandFilterBandwidth(self: *Device, bandwidth_hz: u32) Error!void {
         try checkResult(c.hackrf_set_baseband_filter_bandwidth(self.handle, bandwidth_hz));
+        self.config.bb_filter_bw_hz = bandwidth_hz;
     }
 
     /// Enable or disable the RF amplifier (14dB)
-    pub fn setAmpEnable(self: Device, enable: bool) Error!void {
+    pub fn setAmpEnable(self: *Device, enable: bool) Error!void {
         try checkResult(c.hackrf_set_amp_enable(self.handle, @intFromBool(enable)));
+        self.config.amp_enable = enable;
     }
 
     /// Set LNA gain (0-40 dB in 8dB steps)
-    pub fn setLnaGain(self: Device, value: u32) Error!void {
+    pub fn setLnaGain(self: *Device, value: u32) Error!void {
         try checkResult(c.hackrf_set_lna_gain(self.handle, value));
+        self.config.lna_gain = value;
     }
 
     /// Set VGA gain (0-62 dB in 2dB steps)
-    pub fn setVgaGain(self: Device, value: u32) Error!void {
+    pub fn setVgaGain(self: *Device, value: u32) Error!void {
         try checkResult(c.hackrf_set_vga_gain(self.handle, value));
+        self.config.vga_gain = value;
     }
 
     /// Set TX VGA gain (0-47 dB in 1dB steps)
-    pub fn setTxVgaGain(self: Device, value: u32) Error!void {
+    pub fn setTxVgaGain(self: *Device, value: u32) Error!void {
         try checkResult(c.hackrf_set_txvga_gain(self.handle, value));
+        self.config.tx_vga_gain = value;
     }
 
     /// Enable or disable antenna port power (bias tee)
-    pub fn setAntennaEnable(self: Device, enable: bool) Error!void {
+    pub fn setAntennaEnable(self: *Device, enable: bool) Error!void {
         try checkResult(c.hackrf_set_antenna_enable(self.handle, @intFromBool(enable)));
+        self.config.antenna_enable = enable;
     }
 
     /// Set hardware sync mode
-    pub fn setHwSyncMode(self: Device, enable: bool) Error!void {
+    pub fn setHwSyncMode(self: *Device, enable: bool) Error!void {
         try checkResult(c.hackrf_set_hw_sync_mode(self.handle, @intFromBool(enable)));
+        self.config.hw_sync_mode = enable;
     }
 
     /// Set clock output enable
-    pub fn setClkoutEnable(self: Device, enable: bool) Error!void {
+    pub fn setClkoutEnable(self: *Device, enable: bool) Error!void {
         try checkResult(c.hackrf_set_clkout_enable(self.handle, @intFromBool(enable)));
+        self.config.clkout_enable = enable;
     }
 
     /// Set UI enable
-    pub fn setUiEnable(self: Device, enable: bool) Error!void {
+    pub fn setUiEnable(self: *Device, enable: bool) Error!void {
         try checkResult(c.hackrf_set_ui_enable(self.handle, @intFromBool(enable)));
+        self.config.ui_enable = enable;
     }
 
     /// Set TX underrun limit
-    pub fn setTxUnderrunLimit(self: Device, value: u32) Error!void {
+    pub fn setTxUnderrunLimit(self: *Device, value: u32) Error!void {
         try checkResult(c.hackrf_set_tx_underrun_limit(self.handle, value));
+        self.config.tx_underrun_limit = value;
     }
 
     /// Set RX overrun limit
-    pub fn setRxOverrunLimit(self: Device, value: u32) Error!void {
+    pub fn setRxOverrunLimit(self: *Device, value: u32) Error!void {
         try checkResult(c.hackrf_set_rx_overrun_limit(self.handle, value));
+        self.config.rx_overrun_limit = value;
+    }
+
+    /// Push the entire `Config` shadow to the hardware.
+    ///
+    /// Order matters: `hackrf_set_sample_rate` re-derives the baseband filter
+    /// to a default tied to the new rate, so the filter bandwidth is pushed
+    /// after the sample rate. Call this before `startRx`/`startTx`; calling
+    /// it during an active stream is safe but `setSampleRate` momentarily
+    /// disturbs streaming.
+    pub fn applyConfig(self: *Device) Error!void {
+        try self.setSampleRate(self.config.sample_rate_hz);
+        try self.setBasebandFilterBandwidth(self.config.bb_filter_bw_hz);
+        try self.setFreq(self.config.freq_hz);
+        try self.setAmpEnable(self.config.amp_enable);
+        try self.setLnaGain(self.config.lna_gain);
+        try self.setVgaGain(self.config.vga_gain);
+        try self.setTxVgaGain(self.config.tx_vga_gain);
+        try self.setAntennaEnable(self.config.antenna_enable);
+        try self.setHwSyncMode(self.config.hw_sync_mode);
+        try self.setClkoutEnable(self.config.clkout_enable);
+        try self.setUiEnable(self.config.ui_enable);
+        if (self.config.tx_underrun_limit) |v| try self.setTxUnderrunLimit(v);
+        if (self.config.rx_overrun_limit) |v| try self.setRxOverrunLimit(v);
+    }
+
+    // === Configuration getters ===
+    //
+    // These read the Zig-side `Config` shadow. libhackrf has no real getter
+    // API for these knobs, so values reflect the last successful `set*` call
+    // (or the defaults if nothing has been set yet).
+
+    pub fn getSampleRate(self: *const Device) f64 {
+        return self.config.sample_rate_hz;
+    }
+
+    pub fn getFreq(self: *const Device) u64 {
+        return self.config.freq_hz;
+    }
+
+    pub fn getBasebandFilterBandwidth(self: *const Device) u32 {
+        return self.config.bb_filter_bw_hz;
+    }
+
+    pub fn getLnaGain(self: *const Device) u32 {
+        return self.config.lna_gain;
+    }
+
+    pub fn getVgaGain(self: *const Device) u32 {
+        return self.config.vga_gain;
+    }
+
+    pub fn getTxVgaGain(self: *const Device) u32 {
+        return self.config.tx_vga_gain;
+    }
+
+    pub fn getAmpEnable(self: *const Device) bool {
+        return self.config.amp_enable;
+    }
+
+    pub fn getAntennaEnable(self: *const Device) bool {
+        return self.config.antenna_enable;
+    }
+
+    /// Alias for `getAntennaEnable` — the antenna port power line is the
+    /// bias tee on HackRF One.
+    pub fn getBiasTee(self: *const Device) bool {
+        return self.config.antenna_enable;
+    }
+
+    /// Approximate total RX gain in dB: `lna_gain + vga_gain + 14` if the
+    /// front-end amp is enabled. Useful as a single "how hot is the chain"
+    /// number for UI display; individual stages are still accessible via
+    /// `getLnaGain`, `getVgaGain`, `getAmpEnable`.
+    pub fn getGain(self: *const Device) u32 {
+        return self.config.lna_gain + self.config.vga_gain + if (self.config.amp_enable) @as(u32, 14) else 0;
+    }
+
+    pub fn getHwSyncMode(self: *const Device) bool {
+        return self.config.hw_sync_mode;
+    }
+
+    pub fn getClkoutEnable(self: *const Device) bool {
+        return self.config.clkout_enable;
+    }
+
+    pub fn getUiEnable(self: *const Device) bool {
+        return self.config.ui_enable;
     }
 
     // === Device Info ===

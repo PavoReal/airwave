@@ -2,9 +2,9 @@ const std = @import("std");
 const hackrf = @import("hackrf");
 const FixedSizeRingBuffer = @import("ring_buffer.zig").FixedSizeRingBuffer;
 
-var sdr: hackrf.Device = undefined;
+pub var sdr: hackrf.Device = undefined;
 
-var sdr_rx_state = struct {
+pub var sdr_rx_state = struct {
     rx_ring_buffer: FixedSizeRingBuffer(hackrf.IQSample) = undefined,
     mutex: std.Io.Mutex = undefined,
     running: bool = false,
@@ -22,24 +22,34 @@ fn sdrRxCallback(trans: hackrf.Transfer, state: *@TypeOf(sdr_rx_state)) hackrf.S
     return .@"continue";
 }
 
-pub fn start(alloc: std.mem.Allocator, io: std.Io) !void {
+pub fn init() !void {
     try hackrf.init();
+}
 
-    sdr = try hackrf.Device.open();
+pub fn deinit() !void {
+    try hackrf.deinit();
+}
+
+pub fn start(alloc: std.mem.Allocator, io: std.Io, device_idx: usize) !void {
+    const devices = try hackrf.DeviceList.get();
+    defer devices.deinit();
+
+    sdr = try devices.open(device_idx);
 
     sdr_rx_state.rx_ring_buffer = try FixedSizeRingBuffer(hackrf.IQSample).init(alloc, 1024 * 1024);
     sdr_rx_state.mutex = std.Io.Mutex.init;
     sdr_rx_state.io = io;
 
-    try sdr.setSampleRate(2_000_000); // 2 msps
-    try sdr.setFreq(1_090_00_00);
+    try sdr.applyConfig();
 
     try sdr.startRx(*@TypeOf(sdr_rx_state), sdrRxCallback, &sdr_rx_state);
     std.debug.print("SDR started\n", .{});
     sdr_rx_state.running = false;
 }
 
-pub fn stop() !void {
+pub fn stop(alloc: std.mem.Allocator) !void {
+    try sdr.stopRx();
+    sdr_rx_state.rx_ring_buffer.deinit(alloc);
+    std.debug.print("SDR stopped\n", .{});
     sdr.close();
-    hackrf.deinit() catch {};
 }
