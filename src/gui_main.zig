@@ -87,8 +87,8 @@ pub fn main() !void {
     if (!ImGui_ImplSDLGPU3_Init(&sdlgpu_info)) @panic("ImGui_ImplSDLGPU3_Init failed");
     defer ImGui_ImplSDLGPU3_Shutdown();
 
-    var show_demo: bool = true;
     var running = true;
+
     while (running) {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
@@ -106,12 +106,19 @@ pub fn main() !void {
         ImGui_ImplSDL3_NewFrame();
         zgui.newFrame();
 
-        if (show_demo) zgui.showDemoWindow(&show_demo);
+        //
+        //
+        //
 
         if (zgui.begin("airwave", .{})) {
             zgui.text("hello from airwave-gui", .{});
             zgui.text("SDL3 + SDL_GPU + Dear ImGui", .{});
         }
+
+        //
+        //
+        //
+
         zgui.end();
 
         zgui.render();
